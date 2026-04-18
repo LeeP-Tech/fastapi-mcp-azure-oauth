@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "fastapi-mcp-azure-oauth"
-version = "1.0.0"
+version = "1.0.1"
 description = "RFC-compliant Azure AD OAuth 2.0 router for FastAPI MCP servers with Copilot Studio support"
 readme = "README.md"
 license = { text = "MIT" }

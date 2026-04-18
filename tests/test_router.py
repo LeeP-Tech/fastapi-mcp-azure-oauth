@@ -246,3 +246,27 @@ class TestCustomParameters:
     def test_custom_config_redirect_uri(self, custom_client):
         data = custom_client.get("/oauth/config").json()
         assert data["redirect_uri"].endswith("/my/callback")
+
+
+# ---------------------------------------------------------------------------
+# Multi-tenant allowed_tenant_ids (>1 entry) falls back to /organizations
+# ---------------------------------------------------------------------------
+
+class TestMultipleAllowedTenants:
+    @pytest.fixture(scope="class")
+    def multi_tenant_client(self):
+        app = FastAPI()
+        app.include_router(
+            build_oauth_router(
+                app_id=APP_ID,
+                tenant_id=TENANT_ID,
+                client_secret=SECRET,
+                allowed_tenant_ids=["tenant-a", "tenant-b"],
+            )
+        )
+        with TestClient(app) as c:
+            yield c
+
+    def test_multiple_allowed_tenants_uses_organizations(self, multi_tenant_client):
+        data = multi_tenant_client.get("/.well-known/oauth-authorization-server").json()
+        assert "organizations" in data["issuer"]
