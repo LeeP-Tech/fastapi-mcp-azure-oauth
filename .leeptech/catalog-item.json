@@ -1,0 +1,16 @@
+{
+"type": "project",
+"title": "fastapi-mcp-azure-oauth",
+"description": "RFC-compliant Azure AD OAuth 2.0 router for FastAPI MCP servers. Implements RFC 8414 discovery, RFC 7591 Dynamic Client Registration with automatic Azure AD redirect URI enrolment via Microsoft Graph, RFC 9728 protected resource metadata, and JWT token validation with per-tenant JWKS caching and explicit issuer binding. Built for first-class Copilot Studio compatibility.",
+"status": "done",
+"tags": ["github", "projects", "python", "fastapi", "azure", "oauth2", "mcp", "jwt", "azure-ad", "copilot-studio", "microsoft-graph", "pyjwt"],
+"href": "https://github.com/LeeP-Tech/fastapi-mcp-azure-oauth",
+"websiteUrl": "https://pypi.org/project/fastapi-mcp-azure-oauth/",
+"external": true,
+"links": [
+{ "label": "Repository", "href": "https://github.com/LeeP-Tech/fastapi-mcp-azure-oauth" },
+{ "label": "Live", "href": "https://pypi.org/project/fastapi-mcp-azure-oauth/" }
+],
+"footer": "Published on PyPI. Requires Python 3.10+ and FastAPI 0.115+.",
+"order": 10
+}
