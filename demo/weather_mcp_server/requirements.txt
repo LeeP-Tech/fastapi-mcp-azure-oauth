@@ -1,0 +1,5 @@
+fastapi-mcp-azure-oauth>=1.0.0
+fastapi>=0.115.0
+httpx>=0.27.0
+mcp[cli]>=1.6.0
+uvicorn>=0.29.0
