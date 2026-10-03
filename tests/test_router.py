@@ -114,61 +114,172 @@ class TestRegister:
         assert "email" in data["scope"]
         assert "profile" in data["scope"]
 
+    def test_get_register_never_returns_secret(self, client):
+        resp = client.get("/register")
+        assert "client_secret" not in resp.json()
+        assert SECRET not in resp.text
+
     def test_post_register_with_no_uris(self, client):
+        with patch(
+            "fastapi_mcp_azure_oauth.router.add_redirect_uri_to_azure_ad",
+            new_callable=AsyncMock,
+        ) as fake_add:
+            resp = client.post("/register", json={"redirect_uris": []})
+        assert resp.status_code == 201
+        assert resp.json()["client_id"] == APP_ID
+        assert resp.json()["redirect_uris"] == []
+        fake_add.assert_not_called()
+
+    def test_post_register_never_returns_secret(self, client):
+        resp = client.post("/register", json={"redirect_uris": []})
+        assert "client_secret" not in resp.json()
+        assert SECRET not in resp.text
+
+    def test_post_register_ignores_uris_without_allowlist(self, client):
+        with patch(
+            "fastapi_mcp_azure_oauth.router.add_redirect_uri_to_azure_ad",
+            new_callable=AsyncMock,
+        ) as fake_add:
+            resp = client.post(
+                "/register",
+                json={"redirect_uris": ["https://evil.example.com/cb"]},
+            )
+        assert resp.status_code == 201
+        assert resp.json()["redirect_uris"] == []
+        fake_add.assert_not_called()
+
+    def test_post_register_does_not_enrol_host_header_callback(self, client):
+        with patch(
+            "fastapi_mcp_azure_oauth.router.add_redirect_uri_to_azure_ad",
+            new_callable=AsyncMock,
+        ) as fake_add:
+            client.post(
+                "/register",
+                json={"redirect_uris": []},
+                headers={"Host": "evil.example.com"},
+            )
+        fake_add.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Dynamic Client Registration with base_url and redirect URI allowlist
+# ---------------------------------------------------------------------------
+
+BASE_URL = "https://mcp.example.com"
+ALLOWED_URI = "https://copilot.example.com/cb"
+ALLOWED_HTTP_URI = "http://insecure.example.com/cb"
+FAILING_URI = "https://fail.example.com/cb"
+
+
+@pytest.fixture
+def allowlist_client():
+    app = FastAPI()
+    app.include_router(
+        build_oauth_router(
+            app_id=APP_ID,
+            tenant_id=TENANT_ID,
+            client_secret=SECRET,
+            base_url=BASE_URL + "/",
+            allowed_redirect_uris=[ALLOWED_URI, ALLOWED_HTTP_URI, FAILING_URI],
+        )
+    )
+    with TestClient(app) as c:
+        yield c
+
+
+async def _fake_add(uri, **_kw):
+    if "fail" in uri:
+        raise Exception("graph error")
+    return {"success": True, "redirect_uri": uri}
+
+
+class TestRegisterWithAllowlist:
+    def test_allowlisted_uri_and_server_callback_registered(self, allowlist_client):
+        with patch(
+            "fastapi_mcp_azure_oauth.router.add_redirect_uri_to_azure_ad",
+            side_effect=_fake_add,
+        ):
+            resp = allowlist_client.post("/register", json={"redirect_uris": [ALLOWED_URI]})
+        assert resp.status_code == 201
+        assert resp.json()["redirect_uris"] == [f"{BASE_URL}/oauth/callback", ALLOWED_URI]
+
+    def test_server_callback_uses_base_url_not_host_header(self, allowlist_client):
+        with patch(
+            "fastapi_mcp_azure_oauth.router.add_redirect_uri_to_azure_ad",
+            side_effect=_fake_add,
+        ) as fake_add:
+            allowlist_client.post(
+                "/register",
+                json={"redirect_uris": []},
+                headers={"Host": "evil.example.com"},
+            )
+        enrolled = [c.args[0] for c in fake_add.call_args_list]
+        assert enrolled == [f"{BASE_URL}/oauth/callback"]
+
+    def test_non_allowlisted_uri_ignored(self, allowlist_client):
+        with patch(
+            "fastapi_mcp_azure_oauth.router.add_redirect_uri_to_azure_ad",
+            side_effect=_fake_add,
+        ) as fake_add:
+            resp = allowlist_client.post(
+                "/register",
+                json={"redirect_uris": ["https://evil.example.com/cb"]},
+            )
+        assert "https://evil.example.com/cb" not in resp.json()["redirect_uris"]
+        enrolled = [c.args[0] for c in fake_add.call_args_list]
+        assert "https://evil.example.com/cb" not in enrolled
+
+    def test_http_uris_skipped_even_if_allowlisted(self, allowlist_client):
+        with patch(
+            "fastapi_mcp_azure_oauth.router.add_redirect_uri_to_azure_ad",
+            side_effect=_fake_add,
+        ):
+            resp = allowlist_client.post(
+                "/register", json={"redirect_uris": [ALLOWED_HTTP_URI]}
+            )
+        assert ALLOWED_HTTP_URI not in resp.json()["redirect_uris"]
+
+    def test_partial_failure_returns_successes(self, allowlist_client):
+        with patch(
+            "fastapi_mcp_azure_oauth.router.add_redirect_uri_to_azure_ad",
+            side_effect=_fake_add,
+        ):
+            resp = allowlist_client.post(
+                "/register", json={"redirect_uris": [ALLOWED_URI, FAILING_URI]}
+            )
+        assert resp.status_code == 201
+        uris = resp.json()["redirect_uris"]
+        assert ALLOWED_URI in uris
+        assert FAILING_URI not in uris
+
+    def test_server_callback_failure_is_tolerated(self, allowlist_client):
         with patch(
             "fastapi_mcp_azure_oauth.router.add_redirect_uri_to_azure_ad",
             new_callable=AsyncMock,
             side_effect=Exception("no graph"),
         ):
-            resp = client.post("/register", json={"redirect_uris": []})
+            resp = allowlist_client.post("/register", json={"redirect_uris": []})
         assert resp.status_code == 201
-        assert resp.json()["client_id"] == APP_ID
+        assert resp.json()["redirect_uris"] == []
 
-    def test_post_register_https_uris_registered(self, client):
-        async def fake_add(uri, **_kw):
-            return {"success": True, "redirect_uri": uri}
+    def test_enrolment_happens_once_per_uri(self, allowlist_client):
+        with patch(
+            "fastapi_mcp_azure_oauth.router.add_redirect_uri_to_azure_ad",
+            side_effect=_fake_add,
+        ) as fake_add:
+            for _ in range(3):
+                resp = allowlist_client.post(
+                    "/register", json={"redirect_uris": [ALLOWED_URI, ALLOWED_URI]}
+                )
+        assert fake_add.call_count == 2
+        assert resp.json()["redirect_uris"] == [f"{BASE_URL}/oauth/callback", ALLOWED_URI]
 
-        with patch("fastapi_mcp_azure_oauth.router.add_redirect_uri_to_azure_ad", side_effect=fake_add):
-            resp = client.post(
-                "/register",
-                json={"redirect_uris": ["https://copilot.example.com/cb"]},
-            )
-        assert resp.status_code == 201
-        data = resp.json()
-        assert "https://copilot.example.com/cb" in data["redirect_uris"]
-        assert any("oauth/callback" in u for u in data["redirect_uris"])
-
-    def test_post_register_http_uris_skipped(self, client):
-        async def fake_add(uri, **_kw):
-            return {"success": True, "redirect_uri": uri}
-
-        with patch("fastapi_mcp_azure_oauth.router.add_redirect_uri_to_azure_ad", side_effect=fake_add):
-            resp = client.post(
-                "/register",
-                json={"redirect_uris": ["http://insecure.example.com/cb"]},
-            )
-        assert "http://insecure.example.com/cb" not in resp.json()["redirect_uris"]
-
-    def test_post_register_partial_failure_returns_successes(self, client):
-        async def fake_add(uri, **_kw):
-            if "fail" in uri:
-                raise Exception("graph error")
-            return {"success": True, "redirect_uri": uri}
-
-        with patch("fastapi_mcp_azure_oauth.router.add_redirect_uri_to_azure_ad", side_effect=fake_add):
-            resp = client.post(
-                "/register",
-                json={
-                    "redirect_uris": [
-                        "https://good.example.com/cb",
-                        "https://fail.example.com/cb",
-                    ]
-                },
-            )
-        assert resp.status_code == 201
-        uris = resp.json()["redirect_uris"]
-        assert "https://good.example.com/cb" in uris
-        assert "https://fail.example.com/cb" not in uris
+    def test_discovery_uses_base_url(self, allowlist_client):
+        data = allowlist_client.get(
+            "/.well-known/oauth-protected-resource/mcp",
+            headers={"Host": "evil.example.com"},
+        ).json()
+        assert data["resource"] == f"{BASE_URL}/mcp"
 
 
 # ---------------------------------------------------------------------------

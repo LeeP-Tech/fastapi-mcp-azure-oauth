@@ -13,6 +13,11 @@ export AZURE_CLIENT_ID="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
 export AZURE_TENANT_ID="yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy"
 export AZURE_CLIENT_SECRET="your-client-secret"
 
+# Optional
+export PUBLIC_BASE_URL="https://weather-mcp.example.com"          # public URL of this server
+export AZURE_ALLOWED_TENANT_IDS="yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy"  # defaults to AZURE_TENANT_ID
+export ALLOWED_REDIRECT_URIS="https://your-client.example.com/callback" # URIs /register may enrol
+
 uvicorn demo.weather_mcp_server.server:app --reload
 ```
 
@@ -28,3 +33,9 @@ The server will be available at `http://localhost:8000`.
 ## Connecting from Copilot Studio
 
 Point Copilot Studio at `https://your-server/mcp` and it will autodiscover the OAuth endpoints via `/.well-known/`.
+
+The server never returns its client secret. Enter the client ID and secret in Copilot Studio's
+connector configuration yourself, and add Copilot Studio's redirect URI either directly in the
+Azure AD app registration or via `ALLOWED_REDIRECT_URIS`.
+
+Only tokens from `AZURE_ALLOWED_TENANT_IDS` that carry the `access_as_user` scope are accepted.

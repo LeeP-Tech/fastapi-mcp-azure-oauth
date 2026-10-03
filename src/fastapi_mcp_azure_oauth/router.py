@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from fastapi import APIRouter, Request
 
@@ -22,6 +22,8 @@ def build_oauth_router(
     resource_path: str = "/mcp",
     allowed_tenant_ids: Optional[List[str]] = None,
     config_redirect_uri_path: str = "/oauth/callback",
+    base_url: Optional[str] = None,
+    allowed_redirect_uris: Optional[List[str]] = None,
 ) -> APIRouter:
     """Build and return a FastAPI ``APIRouter`` with all OAuth 2.0 discovery,
     registration, callback, and configuration endpoints.
@@ -31,7 +33,10 @@ def build_oauth_router(
     * **RFC 8414** ``/.well-known/oauth-authorization-server`` — points clients
       at Azure AD's real authorization and token endpoints.
     * **RFC 7591** ``GET``/``POST /register`` — Dynamic Client Registration.
-      ``POST`` auto-registers redirect URIs in Azure AD via Microsoft Graph.
+      Returns the pre-provisioned ``client_id``; the client secret is never
+      returned and must be configured in the client out-of-band.  ``POST``
+      enrols redirect URIs in Azure AD via Microsoft Graph, restricted to
+      ``allowed_redirect_uris``.
     * **RFC 9728** ``/.well-known/oauth-protected-resource/{slug}`` — protected
       resource metadata for MCP client autodiscovery.
     * ``GET /oauth/callback`` — minimal callback endpoint (echoes code + state).
@@ -44,7 +49,8 @@ def build_oauth_router(
                                   ``allowed_tenant_ids`` contains exactly one entry.
                                   Pass ``"organizations"`` for fully multi-tenant
                                   deployments where no restriction is desired.
-        client_secret:            Azure AD client secret.
+        client_secret:            Azure AD client secret.  Used only for Microsoft
+                                  Graph calls; never returned by any endpoint.
         api_scope:                Scope name exposed under ``api://{app_id}/``.
                                   Defaults to ``"access_as_user"``.
         resource_path:            Path to the protected MCP resource, e.g. ``"/mcp"``.
@@ -56,6 +62,16 @@ def build_oauth_router(
         config_redirect_uri_path: Server-relative path returned as ``redirect_uri``
                                   in ``GET /oauth/config``.  Defaults to
                                   ``"/oauth/callback"``.
+        base_url:                 Public base URL of this server, e.g.
+                                  ``"https://mcp.example.com"``.  Strongly
+                                  recommended: without it, URLs in responses are
+                                  derived from the request's ``Host`` header,
+                                  and the server's own callback is never
+                                  enrolled in Azure AD.
+        allowed_redirect_uris:    Exact redirect URIs that ``POST /register`` may
+                                  enrol in Azure AD.  Any other URI in a
+                                  registration request is ignored.  ``None``
+                                  (default) enrols no client-supplied URIs.
 
     Returns:
         A configured :class:`fastapi.APIRouter`.
@@ -73,12 +89,16 @@ def build_oauth_router(
                 client_secret="your-secret",
                 api_scope="access_as_user",
                 resource_path="/mcp",
+                base_url="https://mcp.example.com",
             )
         )
     """
     # Normalise resource path
     resource_path = "/" + resource_path.lstrip("/")
     resource_slug = resource_path.lstrip("/")
+    configured_base_url = base_url.rstrip("/") if base_url else None
+    redirect_uri_allowlist = set(allowed_redirect_uris or [])
+    enrolled_uris: Set[str] = set()
 
     # ------------------------------------------------------------------
     # Internal helpers (closures over configuration)
@@ -95,6 +115,36 @@ def build_oauth_router(
         if len(allowed_tenant_ids) == 1:
             return allowed_tenant_ids[0]
         return "organizations"
+
+    def _base_url(request: Request) -> str:
+        """Return the configured public base URL, falling back to the request."""
+        return configured_base_url or str(request.base_url).rstrip("/")
+
+    def _registration_response() -> Dict[str, Any]:
+        return {
+            "client_id": app_id,
+            "token_endpoint_auth_method": "client_secret_post",
+            "scope": f"{app_id}/.default openid profile email offline_access",
+            "grant_types": ["authorization_code"],
+            "response_types": ["code"],
+        }
+
+    async def _enrol_redirect_uri(uri: str) -> bool:
+        """Add *uri* to the Azure AD app registration, once per process."""
+        if uri in enrolled_uris:
+            return True
+        try:
+            await add_redirect_uri_to_azure_ad(
+                uri,
+                app_id=app_id,
+                tenant_id=tenant_id,
+                client_secret=client_secret,
+            )
+        except Exception as exc:
+            logger.warning("Failed to register redirect URI %s: %s", uri, exc)
+            return False
+        enrolled_uris.add(uri)
+        return True
 
     def _discovery_doc(tenant: str, base_url: str) -> Dict[str, Any]:
         doc: Dict[str, Any] = {
@@ -137,7 +187,7 @@ def build_oauth_router(
     )
     async def oauth_discovery(request: Request) -> Dict[str, Any]:
         """Return RFC 8414 authorization server metadata pointing at Azure AD."""
-        base_url = str(request.base_url).rstrip("/")
+        base_url = _base_url(request)
         return _discovery_doc(_authority_tenant(), base_url)
 
     @router.get(
@@ -147,7 +197,7 @@ def build_oauth_router(
     )
     async def oauth_discovery_alias(request: Request) -> Dict[str, Any]:
         """Resource-scoped alias for ``/.well-known/oauth-authorization-server``."""
-        base_url = str(request.base_url).rstrip("/")
+        base_url = _base_url(request)
         return _discovery_doc(_authority_tenant(), base_url)
 
     @router.get(
@@ -158,7 +208,7 @@ def build_oauth_router(
     async def oauth_protected_resource(request: Request) -> Dict[str, Any]:
         """Return RFC 9728 protected resource metadata for MCP client autodiscovery."""
         tenant = _authority_tenant()
-        base_url = str(request.base_url).rstrip("/")
+        base_url = _base_url(request)
         return {
             "resource": f"{base_url}{resource_path}",
             "authorization_servers": [
@@ -173,19 +223,13 @@ def build_oauth_router(
         tags=["OAuth"],
     )
     async def oauth_register_get() -> Dict[str, Any]:
-        """Return pre-provisioned app credentials.
+        """Return the pre-provisioned client ID.
 
         This ``GET`` variant exists for Copilot Studio compatibility — it sends
         ``GET /register`` rather than ``POST`` when first discovering credentials.
+        The client secret is not returned; configure it in the client directly.
         """
-        return {
-            "client_id": app_id,
-            "client_secret": client_secret,
-            "token_endpoint_auth_method": "client_secret_post",
-            "scope": f"{app_id}/.default openid profile email offline_access",
-            "grant_types": ["authorization_code"],
-            "response_types": ["code"],
-        }
+        return _registration_response()
 
     @router.post(
         "/register",
@@ -193,59 +237,33 @@ def build_oauth_router(
         summary="RFC 7591 Dynamic Client Registration (POST)",
         tags=["OAuth"],
     )
-    async def oauth_register(
-        body: ClientRegistrationRequest, request: Request
-    ) -> Dict[str, Any]:
-        """Register a client and auto-enroll redirect URIs in Azure AD.
+    async def oauth_register(body: ClientRegistrationRequest) -> Dict[str, Any]:
+        """Register a client and enrol permitted redirect URIs in Azure AD.
 
-        For each ``https://`` redirect URI in the request, the server calls
-        Microsoft Graph to add it to the app registration's ``spa.redirectUris``.
-        The server's own ``/oauth/callback`` is always enrolled.
+        Only redirect URIs listed in ``allowed_redirect_uris`` are added to the
+        app registration's ``spa.redirectUris`` via Microsoft Graph; any others
+        are ignored.  The server's own ``/oauth/callback`` is enrolled only when
+        ``base_url`` is configured, so it can never be derived from a
+        client-controlled ``Host`` header.
 
         Failures are logged as warnings and do not abort the response —
         successfully registered URIs are returned in ``redirect_uris``.
         """
-        base_url = str(request.base_url).rstrip("/")
-        server_callback = f"{base_url}/oauth/callback"
         registered_uris: List[str] = []
 
-        try:
-            await add_redirect_uri_to_azure_ad(
-                server_callback,
-                app_id=app_id,
-                tenant_id=tenant_id,
-                client_secret=client_secret,
-            )
-            registered_uris.append(server_callback)
-        except Exception as exc:
-            logger.warning(
-                "Failed to register server callback URI %s: %s", server_callback, exc
-            )
+        if configured_base_url:
+            server_callback = f"{configured_base_url}/oauth/callback"
+            if await _enrol_redirect_uri(server_callback):
+                registered_uris.append(server_callback)
 
-        for uri in body.redirect_uris:
-            if uri.startswith("https://"):
-                try:
-                    await add_redirect_uri_to_azure_ad(
-                        uri,
-                        app_id=app_id,
-                        tenant_id=tenant_id,
-                        client_secret=client_secret,
-                    )
-                    registered_uris.append(uri)
-                except Exception as exc:
-                    logger.warning(
-                        "Failed to register redirect URI %s: %s", uri, exc
-                    )
+        for uri in dict.fromkeys(body.redirect_uris):
+            if uri not in redirect_uri_allowlist:
+                logger.warning("Ignoring redirect URI not in allowlist: %r", uri)
+                continue
+            if uri.startswith("https://") and await _enrol_redirect_uri(uri):
+                registered_uris.append(uri)
 
-        return {
-            "client_id": app_id,
-            "client_secret": client_secret,
-            "token_endpoint_auth_method": "client_secret_post",
-            "scope": f"{app_id}/.default openid profile email offline_access",
-            "grant_types": ["authorization_code"],
-            "response_types": ["code"],
-            "redirect_uris": registered_uris,
-        }
+        return {**_registration_response(), "redirect_uris": registered_uris}
 
     @router.get(
         "/oauth/callback",
@@ -272,7 +290,7 @@ def build_oauth_router(
     async def oauth_config(request: Request) -> Dict[str, Any]:
         """Return MSAL-compatible configuration for browser-based clients."""
         tenant = _authority_tenant()
-        base_url = str(request.base_url).rstrip("/")
+        base_url = _base_url(request)
         return {
             "client_id": app_id,
             "tenant_id": tenant,

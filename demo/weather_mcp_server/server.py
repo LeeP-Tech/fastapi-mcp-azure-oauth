@@ -27,6 +27,18 @@ from .weather import get_alerts, get_forecast
 APP_ID        = os.environ["AZURE_CLIENT_ID"]
 TENANT_ID     = os.environ["AZURE_TENANT_ID"]
 CLIENT_SECRET = os.environ["AZURE_CLIENT_SECRET"]
+# Public URL of this server, e.g. https://weather-mcp.example.com
+BASE_URL      = os.environ.get("PUBLIC_BASE_URL")
+# Comma-separated tenant IDs allowed to call the server (defaults to the home tenant)
+ALLOWED_TENANT_IDS = [
+    t.strip()
+    for t in os.environ.get("AZURE_ALLOWED_TENANT_IDS", TENANT_ID).split(",")
+    if t.strip()
+]
+# Comma-separated client redirect URIs that POST /register may enrol in Azure AD
+ALLOWED_REDIRECT_URIS = [
+    u.strip() for u in os.environ.get("ALLOWED_REDIRECT_URIS", "").split(",") if u.strip()
+]
 
 # ---------------------------------------------------------------------------
 # FastAPI app
@@ -46,13 +58,20 @@ app.include_router(
         client_secret=CLIENT_SECRET,
         api_scope="access_as_user",
         resource_path="/mcp",
+        allowed_tenant_ids=ALLOWED_TENANT_IDS,
+        base_url=BASE_URL,
+        allowed_redirect_uris=ALLOWED_REDIRECT_URIS,
     )
 )
 
 # ---------------------------------------------------------------------------
 # 2 — Token validator
 # ---------------------------------------------------------------------------
-validator = TokenValidator(app_id=APP_ID)
+validator = TokenValidator(
+    app_id=APP_ID,
+    allowed_tenant_ids=ALLOWED_TENANT_IDS,
+    required_scopes=["access_as_user"],
+)
 
 
 class BearerAuthMiddleware(BaseHTTPMiddleware):
@@ -68,7 +87,7 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
                     headers={"WWW-Authenticate": 'Bearer error="invalid_token"'},
                 )
             try:
-                validator.validate_token(auth[7:])
+                await validator.validate_token_async(auth[7:])
             except Exception:
                 return JSONResponse(
                     status_code=401,
