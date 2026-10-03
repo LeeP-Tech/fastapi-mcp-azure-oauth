@@ -9,6 +9,10 @@ updates:
     directory: "/demo/weather_mcp_server"
     schedule:
       interval: "weekly"
+    ignore:
+      # The demo uses the mcp 1.x FastMCP API; mcp 2.x needs a migration.
+      - dependency-name: "mcp"
+        versions: [">=2"]
 
   - package-ecosystem: "github-actions"
     directory: "/"
