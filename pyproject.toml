@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "fastapi-mcp-azure-oauth"
-version = "1.0.1"
+version = "2.0.0"
 description = "RFC-compliant Azure AD OAuth 2.0 router for FastAPI MCP servers with Copilot Studio support"
 readme = "README.md"
 license = { text = "MIT" }
@@ -41,8 +41,9 @@ classifiers = [
 ]
 dependencies = [
     "fastapi>=0.115.0",
+    "starlette>=0.49.1",
     "httpx>=0.27.0",
-    "PyJWT[crypto]>=2.8.0",
+    "PyJWT[crypto]>=2.10.1",
     "pydantic>=2.5.0",
 ]
 

@@ -3,13 +3,21 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Dict, List, Optional
 
 import jwt
 from fastapi import Header, HTTPException
 from jwt import PyJWKClient
+from starlette.concurrency import run_in_threadpool
 
 logger = logging.getLogger(__name__)
+
+# Azure AD tenant IDs are GUIDs.  Anything else extracted from an unverified
+# token is rejected before it can trigger a JWKS fetch or touch the cache.
+_TENANT_ID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE
+)
 
 
 class TokenValidator:
@@ -19,9 +27,18 @@ class TokenValidator:
     JWKS clients are cached per-tenant with a bounded eviction policy to prevent
     unbounded memory growth in unrestricted multi-tenant deployments.
 
+    Only access tokens are accepted.  By default a token must be a delegated
+    (user) token carrying a non-empty ``scp`` claim; ID tokens and app-only
+    tokens are rejected.  App-only tokens are accepted only when
+    ``required_roles`` is configured and the token carries one of those roles.
+
     Example::
 
-        validator = TokenValidator(app_id="your-app-id")
+        validator = TokenValidator(
+            app_id="your-app-id",
+            allowed_tenant_ids=["your-tenant-id"],
+            required_scopes=["access_as_user"],
+        )
 
         @app.post("/protected")
         async def handler(claims: dict = Depends(validator.as_dependency)):
@@ -36,6 +53,9 @@ class TokenValidator:
         self,
         app_id: str,
         allowed_tenant_ids: Optional[List[str]] = None,
+        *,
+        required_scopes: Optional[List[str]] = None,
+        required_roles: Optional[List[str]] = None,
     ) -> None:
         """
         Args:
@@ -43,9 +63,20 @@ class TokenValidator:
             allowed_tenant_ids: Optional allowlist of tenant IDs. Tokens from
                                 other tenants are rejected with HTTP 403.
                                 ``None`` (default) accepts all Azure AD tenants.
+            required_scopes:    Delegated scopes, of which the token's ``scp``
+                                claim must contain at least one (e.g.
+                                ``["access_as_user"]``).  ``None`` (default)
+                                accepts any delegated token with a non-empty
+                                ``scp`` claim.
+            required_roles:     App roles that permit app-only (client
+                                credentials) tokens.  The token's ``roles``
+                                claim must contain at least one.  ``None``
+                                (default) rejects all app-only tokens.
         """
         self.app_id = app_id
-        self.allowed_tenants: List[str] = allowed_tenant_ids or []
+        self.allowed_tenants: List[str] = [t.lower() for t in allowed_tenant_ids or []]
+        self.required_scopes: List[str] = required_scopes or []
+        self.required_roles: List[str] = required_roles or []
         self.jwks_clients: Dict[str, PyJWKClient] = {}
         logger.info("TokenValidator initialised for app: %s", app_id)
         if self.allowed_tenants:
@@ -78,10 +109,15 @@ class TokenValidator:
         1. Decode without verification to extract ``iss`` / tenant ID.
         2. Check the tenant against the optional allowlist.
         3. Fetch the correct signing key from Microsoft's JWKS endpoint.
-        4. Verify signature and expiry with ``RS256``.
+        4. Verify signature and expiry with ``RS256`` (``exp`` is required).
         5. Explicitly confirm the signed ``iss`` matches the tenant used to
            select the JWKS key (prevents key-confusion attacks).
         6. Verify ``aud`` is either ``{app_id}`` or ``api://{app_id}``.
+        7. Verify the token is an access token with sufficient permissions
+           (``scp`` for delegated tokens, ``roles`` for app-only tokens).
+
+        This method performs blocking network I/O on a JWKS cache miss.  From
+        async code use :meth:`validate_token_async` instead.
 
         Args:
             token: Raw JWT string (without ``Bearer `` prefix).
@@ -104,6 +140,10 @@ class TokenValidator:
                 tenant_id = issuer.split("/")[-2]
             else:
                 raise HTTPException(status_code=401, detail="Token issuer is not Azure AD")
+
+            if not _TENANT_ID_RE.match(tenant_id):
+                raise HTTPException(status_code=401, detail="Token issuer is not Azure AD")
+            tenant_id = tenant_id.lower()
 
             # Step 2 — tenant allowlist check
             if self.allowed_tenants and tenant_id not in self.allowed_tenants:
@@ -128,6 +168,7 @@ class TokenValidator:
                     "verify_signature": True,
                     "verify_exp": True,
                     "verify_aud": False,
+                    "require": ["exp"],
                 },
             )
 
@@ -152,7 +193,10 @@ class TokenValidator:
                     f"Token audience {token_audience!r} is not accepted"
                 )
 
-            logger.info("Token validated for user: %s", claims.get("oid", "unknown"))
+            # Step 7 — token type and permissions
+            self._check_permissions(claims)
+
+            logger.debug("Token validated for user: %s", claims.get("oid", "unknown"))
             return claims
 
         except jwt.ExpiredSignatureError:
@@ -218,6 +262,39 @@ class TokenValidator:
                 },
             )
 
+    def _check_permissions(self, claims: Dict[str, Any]) -> None:
+        """Reject ID tokens and tokens lacking the required scopes or roles."""
+        scopes = str(claims.get("scp") or "").split()
+        roles = claims.get("roles") or []
+        if not isinstance(roles, list):
+            roles = []
+
+        if scopes:
+            if not self.required_scopes or any(s in scopes for s in self.required_scopes):
+                return
+        elif roles and self.required_roles:
+            if any(r in roles for r in self.required_roles):
+                return
+
+        raise HTTPException(
+            status_code=403,
+            detail="Token does not grant the required permissions",
+            headers={
+                "WWW-Authenticate": (
+                    'Bearer error="insufficient_scope", '
+                    'error_description="Token does not grant the required permissions"'
+                )
+            },
+        )
+
+    async def validate_token_async(self, token: str) -> Dict[str, Any]:
+        """Async wrapper for :meth:`validate_token`.
+
+        Runs validation in a worker thread so JWKS fetches do not block the
+        event loop.
+        """
+        return await run_in_threadpool(self.validate_token, token)
+
     # ------------------------------------------------------------------
     # FastAPI dependency
     # ------------------------------------------------------------------
@@ -239,7 +316,7 @@ class TokenValidator:
                 detail="Authentication required. Provide Authorization: Bearer <token>",
                 headers={"WWW-Authenticate": 'Bearer error="invalid_token"'},
             )
-        return self.validate_token(authorization[7:])
+        return await self.validate_token_async(authorization[7:])
 
     # ------------------------------------------------------------------
     # Claim helpers

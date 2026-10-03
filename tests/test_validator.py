@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 from fastapi import HTTPException
 import jwt
 
@@ -11,7 +11,7 @@ from fastapi_mcp_azure_oauth import TokenValidator
 
 
 APP_ID = "aaaaaaaa-0000-0000-0000-aaaaaaaaaaaa"
-TENANT = "tenant-abc"
+TENANT = "cccccccc-0000-0000-0000-cccccccccccc"
 
 
 # ---------------------------------------------------------------------------
@@ -22,10 +22,19 @@ def _make_validator(app_id=APP_ID, allowed_tenant_ids=None):
     return TokenValidator(app_id=app_id, allowed_tenant_ids=allowed_tenant_ids)
 
 
-def _signed_claims(tid=TENANT, aud=None, iss=None):
+def _signed_claims(tid=TENANT, aud=None, iss=None, **extra):
     aud = aud or f"api://{APP_ID}"
     iss = iss or f"https://login.microsoftonline.com/{tid}/v2.0"
-    return {"tid": tid, "oid": "user-1", "aud": aud, "iss": iss, "exp": 9999999999}
+    claims = {
+        "tid": tid,
+        "oid": "user-1",
+        "aud": aud,
+        "iss": iss,
+        "exp": 9999999999,
+        "scp": "access_as_user",
+    }
+    claims.update(extra)
+    return {k: v for k, v in claims.items() if v is not None}
 
 
 def _fake_token(tid=TENANT, aud=None, iss=None):
@@ -107,13 +116,37 @@ class TestTenantRestrictions:
         assert exc.value.status_code == 401
         assert "issuer" in exc.value.detail.lower()
 
+    @pytest.mark.parametrize(
+        "tenant", ["not-a-guid", "..", "organizations", "x?y=1"]
+    )
+    def test_rejects_non_guid_tenant_before_jwks(self, tenant):
+        import base64, json
+        header = base64.urlsafe_b64encode(b'{"alg":"RS256"}').rstrip(b"=").decode()
+        payload = base64.urlsafe_b64encode(
+            json.dumps({"iss": f"https://login.microsoftonline.com/{tenant}/v2.0"}).encode()
+        ).rstrip(b"=").decode()
+        v = _make_validator()
+        v._get_jwks_client = MagicMock()
+        with pytest.raises(HTTPException) as exc:
+            v.validate_token(f"{header}.{payload}.sig")
+        assert exc.value.status_code == 401
+        v._get_jwks_client.assert_not_called()
+
+    def test_allowed_tenant_match_is_case_insensitive(self):
+        v = _make_validator(allowed_tenant_ids=[TENANT.upper()])
+        _stub_jwks(v)
+        with patch("jwt.decode", side_effect=[_signed_claims(), _signed_claims()]):
+            assert v.validate_token(_fake_token())["oid"] == "user-1"
+
     def test_rejects_disallowed_tenant(self):
         import base64, json
         header = base64.urlsafe_b64encode(b'{"alg":"RS256"}').rstrip(b"=").decode()
         payload = base64.urlsafe_b64encode(
-            json.dumps({"iss": "https://login.microsoftonline.com/other/v2.0"}).encode()
+            json.dumps(
+                {"iss": "https://login.microsoftonline.com/dddddddd-0000-0000-0000-dddddddddddd/v2.0"}
+            ).encode()
         ).rstrip(b"=").decode()
-        v = _make_validator(allowed_tenant_ids=["allowed"])
+        v = _make_validator(allowed_tenant_ids=[TENANT])
         with pytest.raises(HTTPException) as exc:
             v.validate_token(f"{header}.{payload}.sig")
         assert exc.value.status_code == 403
@@ -209,6 +242,76 @@ class TestValidateTokenFullPath:
         assert exc.value.status_code == 401
 
 
+    def test_exp_is_required(self):
+        v = _make_validator()
+        _stub_jwks(v)
+        with patch("jwt.decode", side_effect=[_signed_claims(), _signed_claims()]) as dec:
+            v.validate_token(_fake_token())
+        assert dec.call_args_list[1].kwargs["options"]["require"] == ["exp"]
+
+
+# ---------------------------------------------------------------------------
+# Token type and permission checks
+# ---------------------------------------------------------------------------
+
+def _validate(v, claims):
+    _stub_jwks(v)
+    with patch("jwt.decode", side_effect=[claims, claims]):
+        return v.validate_token(_fake_token())
+
+
+class TestPermissions:
+    def test_id_token_without_scp_rejected(self):
+        with pytest.raises(HTTPException) as exc:
+            _validate(_make_validator(), _signed_claims(aud=APP_ID, scp=None))
+        assert exc.value.status_code == 403
+        assert "insufficient_scope" in exc.value.headers["WWW-Authenticate"]
+
+    def test_app_only_token_rejected_by_default(self):
+        with pytest.raises(HTTPException) as exc:
+            _validate(_make_validator(), _signed_claims(scp=None, roles=["Mcp.Access"]))
+        assert exc.value.status_code == 403
+
+    def test_app_only_token_without_roles_rejected_even_with_required_roles(self):
+        v = TokenValidator(app_id=APP_ID, required_roles=["Mcp.Access"])
+        with pytest.raises(HTTPException) as exc:
+            _validate(v, _signed_claims(scp=None))
+        assert exc.value.status_code == 403
+
+    def test_app_only_token_with_required_role_accepted(self):
+        v = TokenValidator(app_id=APP_ID, required_roles=["Mcp.Access"])
+        claims = _validate(v, _signed_claims(scp=None, roles=["Mcp.Access"]))
+        assert claims["roles"] == ["Mcp.Access"]
+
+    def test_app_only_token_with_other_role_rejected(self):
+        v = TokenValidator(app_id=APP_ID, required_roles=["Mcp.Access"])
+        with pytest.raises(HTTPException) as exc:
+            _validate(v, _signed_claims(scp=None, roles=["Other"]))
+        assert exc.value.status_code == 403
+
+    def test_non_list_roles_rejected(self):
+        v = TokenValidator(app_id=APP_ID, required_roles=["Mcp.Access"])
+        with pytest.raises(HTTPException) as exc:
+            _validate(v, _signed_claims(scp=None, roles="Mcp.Access"))
+        assert exc.value.status_code == 403
+
+    def test_required_scope_present_accepted(self):
+        v = TokenValidator(app_id=APP_ID, required_scopes=["access_as_user"])
+        claims = _validate(v, _signed_claims(scp="openid access_as_user"))
+        assert claims["oid"] == "user-1"
+
+    def test_required_scope_missing_rejected(self):
+        v = TokenValidator(app_id=APP_ID, required_scopes=["access_as_user"])
+        with pytest.raises(HTTPException) as exc:
+            _validate(v, _signed_claims(scp="User.Read"))
+        assert exc.value.status_code == 403
+
+    def test_stores_required_scopes_and_roles(self):
+        v = TokenValidator(app_id=APP_ID, required_scopes=["a"], required_roles=["b"])
+        assert v.required_scopes == ["a"]
+        assert v.required_roles == ["b"]
+
+
 # ---------------------------------------------------------------------------
 # JWKS cache eviction
 # ---------------------------------------------------------------------------
@@ -259,4 +362,16 @@ class TestAsDependency:
         _stub_jwks(v)
         with patch("jwt.decode", side_effect=[_signed_claims(), _signed_claims()]):
             claims = await v.as_dependency(f"Bearer {_fake_token()}")
+        assert claims["oid"] == "user-1"
+
+    @pytest.mark.asyncio
+    async def test_validate_token_async_runs_in_threadpool(self):
+        v = _make_validator()
+        with patch(
+            "fastapi_mcp_azure_oauth.validator.run_in_threadpool",
+            new_callable=AsyncMock,
+            return_value={"oid": "user-1"},
+        ) as pool:
+            claims = await v.validate_token_async("tok")
+        pool.assert_awaited_once_with(v.validate_token, "tok")
         assert claims["oid"] == "user-1"
