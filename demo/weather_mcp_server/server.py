@@ -7,15 +7,17 @@ Run with:
 from __future__ import annotations
 
 import os
-from typing import Any
+from contextlib import asynccontextmanager
+from typing import Any, AsyncIterator
+from urllib.parse import urlparse
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
+from mcp.server.transport_security import TransportSecuritySettings
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
-from starlette.types import ASGIApp
 
 from fastapi_mcp_azure_oauth import TokenValidator, build_oauth_router
 
@@ -40,12 +42,33 @@ ALLOWED_REDIRECT_URIS = [
     u.strip() for u in os.environ.get("ALLOWED_REDIRECT_URIS", "").split(",") if u.strip()
 ]
 
+# DNS rebinding protection for the MCP endpoint: only accept requests whose
+# Host header matches the public URL.  Without PUBLIC_BASE_URL, the MCP SDK
+# defaults to accepting localhost only.
+TRANSPORT_SECURITY = (
+    TransportSecuritySettings(
+        allowed_hosts=[urlparse(BASE_URL).netloc],
+        allowed_origins=[BASE_URL.rstrip("/")],
+    )
+    if BASE_URL
+    else None
+)
+
 # ---------------------------------------------------------------------------
 # FastAPI app
 # ---------------------------------------------------------------------------
+@asynccontextmanager
+async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    # Mounted sub-apps don't get their own lifespan run, so start the MCP
+    # session manager here.
+    async with mcp.session_manager.run():
+        yield
+
+
 app = FastAPI(
     title="Weather MCP Server",
     description="Demonstrates fastapi-mcp-azure-oauth with a simple weather MCP server.",
+    lifespan=lifespan,
 )
 
 # ---------------------------------------------------------------------------
@@ -100,9 +123,9 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
 app.add_middleware(BearerAuthMiddleware)
 
 # ---------------------------------------------------------------------------
-# 3 — MCP server with weather tools, mounted at /mcp
+# 3 — MCP server with weather tools, served at /mcp
 # ---------------------------------------------------------------------------
-mcp = FastMCP("Weather MCP Server")
+mcp = MCPServer("Weather MCP Server")
 
 
 @mcp.tool()
@@ -134,5 +157,12 @@ async def get_weather_forecast(latitude: float, longitude: float) -> str:
     return await get_forecast(latitude, longitude)
 
 
-# Mount the MCP ASGI app — auth is enforced by BearerAuthMiddleware above
-app.mount("/mcp", mcp.streamable_http_app())
+# Mount the MCP ASGI app last so the OAuth routes above take precedence; it
+# serves the MCP endpoint at /mcp.  Auth is enforced by BearerAuthMiddleware.
+app.mount(
+    "/",
+    mcp.streamable_http_app(
+        streamable_http_path="/mcp",
+        transport_security=TRANSPORT_SECURITY,
+    ),
+)

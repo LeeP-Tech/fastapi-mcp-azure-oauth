@@ -1,5 +1,5 @@
 fastapi-mcp-azure-oauth>=2.0.0
 fastapi>=0.142.2
 httpx>=0.28.1
-mcp[cli]>=1.23.0,<2
+mcp[cli]>=2.3.0,<3
 uvicorn>=0.54.0
