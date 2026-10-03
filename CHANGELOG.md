@@ -9,6 +9,16 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Changed
+
+- Demo server migrated to the MCP Python SDK 2.x (`MCPServer`); requires `mcp>=2.3.0,<3`.
+
+### Fixed
+
+- Demo server's MCP endpoint is now served at `/mcp` (previously `/mcp/mcp`) and no longer fails every request with "Task group is not initialized" (the MCP session manager is now started in the app lifespan).
+- Demo server restricts the MCP endpoint's accepted `Host` header to `PUBLIC_BASE_URL`.
+- CI runs an end-to-end smoke test of the demo instead of an import check.
+
 ---
 
 ## [2.0.0] — 2026-10-03

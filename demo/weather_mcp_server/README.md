@@ -14,14 +14,23 @@ export AZURE_TENANT_ID="yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy"
 export AZURE_CLIENT_SECRET="your-client-secret"
 
 # Optional
-export PUBLIC_BASE_URL="https://weather-mcp.example.com"          # public URL of this server
+export PUBLIC_BASE_URL="https://weather-mcp.example.com"          # public URL of this server (required unless serving on localhost)
 export AZURE_ALLOWED_TENANT_IDS="yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy"  # defaults to AZURE_TENANT_ID
 export ALLOWED_REDIRECT_URIS="https://your-client.example.com/callback" # URIs /register may enrol
 
 uvicorn demo.weather_mcp_server.server:app --reload
 ```
 
-The server will be available at `http://localhost:8000`.
+The server will be available at `http://localhost:8000`, with the MCP endpoint at `/mcp`.
+
+The demo uses the MCP Python SDK 2.x (`MCPServer`). The endpoint only accepts requests whose
+`Host` header matches `PUBLIC_BASE_URL` (or localhost when it is unset), to block DNS rebinding.
+
+To check the server end to end without Azure AD credentials:
+
+```bash
+python -m demo.weather_mcp_server.smoke_test
+```
 
 ## Available MCP tools
 
