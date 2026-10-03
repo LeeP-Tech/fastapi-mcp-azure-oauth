@@ -13,7 +13,7 @@
 
 **Please do not open a public GitHub issue for security vulnerabilities.**
 
-Report security issues privately by emailing **lee@pasifull.co.uk** with:
+Report security issues privately by emailing **lee@pasifull.com** with:
 
 - A description of the vulnerability
 - Steps to reproduce (proof-of-concept if available)
